@@ -192,7 +192,7 @@ ChatGLMConfig {
               [0, 0, 0, 1]]])
      ```
 
-  4. **旋转位置编码和自注意力模块**：使用的是不可学习的旋转位置编码
+  4. **旋转位置编码和自注意力模块**：ChatGLM-6B使用的是不可学习的旋转位置编码
 
      ```python
      self.rotary_emb = RotaryEmbedding(
@@ -205,8 +205,114 @@ ChatGLMConfig {
              )
      ```
 
-    
+     **需要注意的是：**源码里旋转位置编码部分的代码实现是有问题的，我们来仔细看一下这部分的实现。假设输入序列的长度为3，向量维度是4，batch size为1，现在来计算位置下标为1的token对应的query的位置编码：（旋转位置编码的原理可以参考这篇文章：[十分钟读懂旋转编码（RoPE）](https://zhuanlan.zhihu.com/p/647109286)）
 
+     + 正确的编码 vs 错误的编码
+
+       ```python
+       # right
+       tensor([[[[-0.8415,  0.5403,  1.9699,  3.0198]]]])
+       
+       # wrong
+       tensor([[[[-1.6829,  0.9700,  1.0806,  3.0098]]]])
+       ```
+
+       
+
+     - 首选需要计算`m * theta`，在源码中的实现为：
+
+       ```python
+       # batch_size = 1, seq_len = 3, dim = 4, base=10000
+       
+       inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim)) # ()
+       t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+       # 得到的结果对应： m_theta_0, m_theta_1
+       freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+       ```
+
+     - 接下来，代码拼接freqs并计算正选和余弦值：
+
+       ```python
+       # 得到的结果对应： m_theta_0, m_theta_1, m_theta_0, m_theta_1
+       emb = torch.cat((freqs, freqs), dim=-1)
+       
+       cos_cached = emb.cos()[:, None, :]
+       sin_cached = emb.sin()[:, None, :]
+       cos, sin = cos_cached[:seq_len, ...], sin_cached[:seq_len, ...]
+       ```
+
+     - 然后获取目标位置(position_id =1)的正选和余弦值：
+
+       ```python
+       # cos_m_theta for token in give position
+       position_id = torch.LongTensor([[1]]) # the second position
+       cos_q = F.embedding(position_id, cos.squeeze(1)).unsqueeze(2) # [sq, b, 1, hn]
+       cos_q, cos_q.shape  # pick up the second index
+       sin_q = F.embedding(position_id, sin.squeeze(1)).unsqueeze(2)
+       ```
+
+     - 然后计算最终的位置编码：
+
+       ```python
+       def rotate_half(x):
+           x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+           return torch.cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in earlier torch versions
+       
+       q = torch.arange(dim).view(1, 1, 1, dim) # seq_len, batch_size, heads, dim
+       # q_0, q_1, q_2, q_3 变成了 -q_2, -q_4, q_0, q_1
+       rh_q = rotate_half(q)
+       qm = (q * cos_q) + (rh_q * sin_q)
+       ```
+
+     - 到这里就可以看到问题出在q和mtheta的下标没有对上。从数学角度来理解，源代码中实现的是：
+
+       ```python
+       [
+           q_0 * cos_mtheta_0 - q_2 * sin_mtheta_0,
+           q_1 * cos_mtheta_1 - q_3 * sin_mtheta_1,
+           q_2 * cos_mtheta_0 + q_0 * sin_mtheta_0,
+           q_3 * cos_mtheta_1 + q_1 * sin_mtheta_1
+       ]
+       ```
+
+       但是正确的计算方式应该是：
+
+       ```python
+       [
+           q_0 * cos_mtheta_0 - q_1 * sin_mtheta_0,
+           q_1 * cos_mtheta_0 + q_0 * sin_mtheta_0,
+           q_2 * cos_mtheta_1 - q_3 * sin_mtheta_1,
+           q_3 * cos_mtheta_1 + q_2 * sin_mtheta_1
+       ]
+       ```
+
+     - 这个问题在ChatGLM2-6B中已经被修复，具体的实现可以去看一下[源码实现](https://huggingface.co/THUDM/chatglm2-6b/blob/main/modeling_chatglm.py#L161)，测试的结果可以参考一下[test_rotary_embedding.ipynb]()
+
+     由于在ChatGLM-6B中使用的2D位置编码，所以在计算位置编码时将维度除以了2，再分别计算q1和q2，然后进行拼接得到q。这里也可以看一下[源码](https://huggingface.co/THUDM/chatglm-6b/blob/main/modeling_chatglm.py#L457)
+
+  2. **INT4/8量化**
+
+     - 现在下载的模型使用FP16精度的权重，但是ChatGLM-6B实现了对权重的INT4/INT8量化，包括每一层的：Wquery, Wkey, Wvalue, Wdense_z, Wh_to_4h, W4h_to_h；
+
+     - **INT8**：模型实现的是[per-tensor粒度的最大绝对值量化方法](https://huggingface.co/THUDM/chatglm-6b/blob/main/quantization.py#L134)
+
+       ```pyt
+       self.weight_scale = (weight_tensor.abs().max(dim=-1).values / ((2 ** (weight_bit_width - 1)) - 1)).half()
+       self.weight = torch.round(weight_tensor / self.weight_scale[:, None]).to(torch.int8)
+       ```
+
+     - **INT4**：使用了[cpm_kernels](https://github.com/OpenBMB/cpm_kernels/tree/master)中的int4WeightCompression方法，不过在源代码里面并没有找到int4WeightCompression这个函数的实现，所以不太清楚具体的怎么做的。
+
+     
+
+## 参考
+
++ [Top-k & Top-p, Temperature](https://zhuanlan.zhihu.com/p/613428710)
++ [为什么int8的取值范围是-128 - 127](https://blog.csdn.net/ordmeng/article/details/99620804)
++ [LLM 量化技术小结](https://zhuanlan.zhihu.com/p/651874446)
++ [详解 QLoRA 原理 （附源码剖析）](https://zhuanlan.zhihu.com/p/638927564)
++ [GPTQ: 模型量化，穷鬼救星](https://github.com/IST-DASLab/gptq/blob/main/llama.py)
++ 
 
 
 ## 参考
