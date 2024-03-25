@@ -301,7 +301,8 @@ ChatGLMConfig {
        self.weight = torch.round(weight_tensor / self.weight_scale[:, None]).to(torch.int8)
        ```
 
-     - **INT4**：使用了[cpm_kernels](https://github.com/OpenBMB/cpm_kernels/tree/master)中的int4WeightCompression方法，不过在源代码里面并没有找到int4WeightCompression这个函数的实现，所以不太清楚具体的怎么做的。
+     - **INT4**：INT4量化后权重的列数减少了一半，再使用[cpm_kernels](https://github.com/OpenBMB/cpm_kernels/tree/master)中的int4WeightCompression方法，这是cpm_kernels定义的一个CUDA kernels。关于CUDA kernels太高深，后面再学。***（为啥是shape列数减半，后面一节的实践结果显示结果的最大值为127，为什么不是7？）***
+- **反量化**：反量化同样使用了cpm_kernels实现的CUDA kernels进行加速，包括：`int4WeightExtractionFloat (INT4->FP32), int4WeightExtractionHalf (INT4->FP16),int8WeightExtractionFloat (INT8->FP32), int8WeightExtractionHalf (INT8->FP16) `
 
      
 
@@ -312,9 +313,6 @@ ChatGLMConfig {
 + [LLM 量化技术小结](https://zhuanlan.zhihu.com/p/651874446)
 + [详解 QLoRA 原理 （附源码剖析）](https://zhuanlan.zhihu.com/p/638927564)
 + [GPTQ: 模型量化，穷鬼救星](https://github.com/IST-DASLab/gptq/blob/main/llama.py)
-+ 
++ [大模型量化之 AWQ 方法](https://zhuanlan.zhihu.com/p/663379191)
++ [ChatGLM两代的部署/微调/实现](https://blog.csdn.net/v_JULY_v/article/details/129880836)
 
-
-## 参考
-
-+ [Top-k & Top-p, Temperature](https://zhuanlan.zhihu.com/p/613428710)
